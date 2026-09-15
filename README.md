@@ -10,6 +10,7 @@ From [dffdeeq/Qwen3-TTS-streaming](https://github.com/dffdeeq/Qwen3-TTS-streamin
 - `torch.compile` + CUDA graphs optimization
 
 Added in this fork:
+- **Partial text → partial audio** - a persistent CustomVoice Talker session accepts already-tokenized text incrementally and returns PCM while upstream text is still arriving
 - **Two-phase streaming** - faster first-chunk latency
 - **Multiple EOS token detection** - broader termination coverage for reliable generation stopping. Fixes sped-up audio and runaway generation in streaming
 - **Hann window crossfade** - click-free chunk boundaries with proper fade-in/fade-out
@@ -86,6 +87,34 @@ for chunk, sr in model.stream_generate_voice_clone(
 | `first_chunk_frames` | 48 | Switch to phase 2 after N frames |
 | `repetition_penalty` | 1.0 | Penalizes repeated tokens (1.0 = disabled) |
 | `repetition_penalty_window` | 100 | Only penalize tokens from the last N steps (0 = unlimited) |
+
+## Partial Text to Partial Audio
+
+`create_text_token_stream()` is for an upstream LLM that emits Qwen tokenizer IDs one at a time. It performs the initial Talker prefill when the first text token arrives, then retains the Talker KV cache for each later codec/text step. It does not build the trailing `<|im_end|>\n<|im_start|>assistant\n` chat-template suffix up front.
+
+```python
+stream = model.model.create_text_token_stream(
+    language="English",
+    speaker="Ryan",
+    emit_every_frames=8,
+    decode_window_frames=80,
+    use_optimized_decode=True,
+)
+
+stream.start(first_text_token_id)
+
+for next_text_token_id in upstream_text_token_ids:
+    pcm = stream.step(next_text_token_id)
+    if pcm is not None:
+        chunk, sample_rate = pcm
+
+while not stream.codec_finished:
+    pcm = stream.step(text_finished=not stream.text_finished)
+    if pcm is not None:
+        chunk, sample_rate = pcm
+```
+
+At each decode position, the Talker receives the embedding sum of the prior generated 16-codebook codec frame and the next available text token. If upstream text is temporarily unavailable it uses `tts_pad`; after upstream text ends it uses `tts_eos` once and then `tts_pad`. See `examples/demo_text_token_stream.py` and `examples/benchmark_text_token_stream.py`.
 
 ## Two-Phase Streaming
 

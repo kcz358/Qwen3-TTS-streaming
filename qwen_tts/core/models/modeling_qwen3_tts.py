@@ -53,6 +53,212 @@ from .configuration_qwen3_tts import (Qwen3TTSConfig,
 logger = logging.get_logger(__name__)
 
 
+class Qwen3TTSTextTokenStream:
+    """Persistent Talker session driven by already-tokenized text tokens."""
+
+    def __init__(
+        self,
+        model: "Qwen3TTSForConditionalGeneration",
+        language: str,
+        speaker: str,
+        *,
+        do_sample: bool = True,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 1.0,
+        subtalker_dosample: bool = True,
+        subtalker_top_k: int = 50,
+        subtalker_top_p: float = 1.0,
+        subtalker_temperature: float = 1.0,
+        emit_every_frames: int = 1,
+        decode_window_frames: int = 80,
+        overlap_samples: int = 512,
+        use_optimized_decode: bool = True,
+    ):
+        self.model = model
+        self.do_sample = do_sample
+        self.top_k = top_k
+        self.top_p = top_p
+        self.temperature = temperature
+        self.subtalker_dosample = subtalker_dosample
+        self.subtalker_top_k = subtalker_top_k
+        self.subtalker_top_p = subtalker_top_p
+        self.subtalker_temperature = subtalker_temperature
+        self.emit_every_frames = emit_every_frames
+        self.decode_window_frames = decode_window_frames
+        self.overlap_samples = overlap_samples
+        self.use_optimized_decode = use_optimized_decode
+        self.language = language
+        self.speaker = speaker
+        self.past_key_values = None
+        self.past_hidden = None
+        self.token = None
+        self.codes: list[torch.Tensor] = []
+        self.frames_since_emit = 0
+        self.decoded_tail = None
+        self.text_finished = False
+        self.sent_text_eos = False
+        self.codec_finished = False
+        self.tts_pad_embed = None
+
+    def _text_embedding(self, token_id: int) -> torch.Tensor:
+        token = torch.tensor([[token_id]], device=self.model.talker.device, dtype=torch.long)
+        return self.model.talker.text_projection(self.model.talker.get_text_embeddings()(token))
+
+    def _control_ids(self) -> tuple[list[int], int]:
+        config = self.model.config.talker_config
+        language = self.language.lower()
+        if language == "auto":
+            control = [config.codec_nothink_id, config.codec_think_bos_id, config.codec_think_eos_id]
+        else:
+            if language not in config.codec_language_id:
+                raise ValueError(f"Unsupported language: {self.language}")
+            control = [
+                config.codec_think_id,
+                config.codec_think_bos_id,
+                config.codec_language_id[language],
+                config.codec_think_eos_id,
+            ]
+        speaker = self.speaker.lower()
+        if speaker not in config.spk_id:
+            raise ValueError(f"Unsupported speaker: {self.speaker}")
+        return control, config.spk_id[speaker]
+
+    def start(self, first_text_token_id: int) -> None:
+        if self.token is not None:
+            raise RuntimeError("This text-token stream has already started")
+        if self.model.speech_tokenizer is None:
+            raise RuntimeError("Speech tokenizer is not loaded")
+
+        config = self.model.config
+        control_ids, speaker_id = self._control_ids()
+        device = self.model.talker.device
+        role_ids = torch.tensor([[config.im_start_token_id, 77091, 198]], device=device, dtype=torch.long)
+        role_embed = self.model.talker.text_projection(self.model.talker.get_text_embeddings()(role_ids))
+
+        tts_ids = torch.tensor(
+            [[config.tts_bos_token_id, config.tts_eos_token_id, config.tts_pad_token_id]],
+            device=device,
+            dtype=torch.long,
+        )
+        tts_bos, _, tts_pad = self.model.talker.text_projection(
+            self.model.talker.get_text_embeddings()(tts_ids)
+        ).chunk(3, dim=1)
+        self.tts_pad_embed = tts_pad
+        prefix_ids = control_ids + [speaker_id, config.talker_config.codec_pad_id]
+        prefix_codec = self.model.talker.get_input_embeddings()(
+            torch.tensor([prefix_ids], device=device, dtype=torch.long)
+        )
+        prefix_text = torch.cat(
+            [tts_pad.expand(-1, len(control_ids), -1), tts_bos, tts_pad], dim=1
+        )
+        first_codec = self.model.talker.get_input_embeddings()(
+            torch.tensor([[config.talker_config.codec_bos_id]], device=device, dtype=torch.long)
+        )
+        initial_embed = torch.cat(
+            [role_embed, prefix_text + prefix_codec, self._text_embedding(first_text_token_id) + first_codec], dim=1
+        )
+        attention_mask = torch.ones(initial_embed.shape[:2], device=device, dtype=torch.long)
+        out = self.model.talker.forward(
+            inputs_embeds=initial_embed,
+            attention_mask=attention_mask,
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict=True,
+            trailing_text_hidden=tts_pad,
+            tts_pad_embed=tts_pad,
+            generation_step=None,
+            past_hidden=None,
+            past_key_values=None,
+            subtalker_dosample=self.subtalker_dosample,
+            subtalker_top_k=self.subtalker_top_k,
+            subtalker_top_p=self.subtalker_top_p,
+            subtalker_temperature=self.subtalker_temperature,
+        )
+        self.past_key_values = out.past_key_values
+        self.past_hidden = out.past_hidden
+        self.token = self._sample(out.logits[:, -1, :])
+
+    def _sample(self, logits: torch.Tensor) -> torch.Tensor:
+        eos_ids = {self.model.config.talker_config.codec_eos_token_id, 2150, 2157, 151670, self.model.config.tts_eos_token_id, self.model.config.im_end_token_id, 151643}
+        suppress_tokens = [i for i in range(self.model.config.talker_config.vocab_size - 1024, self.model.config.talker_config.vocab_size) if i not in eos_ids]
+        if self.do_sample:
+            return _sample_next_token(logits, self.temperature, self.top_k, self.top_p, suppress_tokens)
+        return torch.argmax(logits, dim=-1)
+
+    def _next_text_embedding(self, text_token_id: Optional[int], text_finished: bool) -> torch.Tensor:
+        if text_finished:
+            self.text_finished = True
+        if text_token_id is not None:
+            if self.text_finished:
+                raise RuntimeError("Cannot append text after text_finished")
+            return self._text_embedding(text_token_id)
+        if self.text_finished and not self.sent_text_eos:
+            self.sent_text_eos = True
+            return self._text_embedding(self.model.config.tts_eos_token_id)
+        return self.tts_pad_embed
+
+    def step(self, text_token_id: Optional[int] = None, *, text_finished: bool = False) -> Optional[tuple[np.ndarray, int]]:
+        if self.token is None:
+            raise RuntimeError("Call start(first_text_token_id) before step()")
+        if self.codec_finished:
+            return None
+        text_embed = self._next_text_embedding(text_token_id, text_finished)
+        out = self.model.talker.forward(
+            input_ids=self.token.unsqueeze(1),
+            use_cache=True,
+            return_dict=True,
+            output_hidden_states=False,
+            past_key_values=self.past_key_values,
+            past_hidden=self.past_hidden,
+            generation_step=0,
+            trailing_text_hidden=text_embed,
+            tts_pad_embed=self.tts_pad_embed,
+            subtalker_dosample=self.subtalker_dosample,
+            subtalker_top_k=self.subtalker_top_k,
+            subtalker_top_p=self.subtalker_top_p,
+            subtalker_temperature=self.subtalker_temperature,
+        )
+        self.past_key_values = out.past_key_values
+        self.past_hidden = out.past_hidden
+        codec_ids = out.hidden_states[1]
+        if codec_ids[0, 0].item() == self.model.config.talker_config.codec_eos_token_id:
+            self.codec_finished = True
+            return self.flush()
+        self.codes.append(codec_ids[0].detach())
+        self.token = self._sample(out.logits[:, -1, :])
+        self.frames_since_emit += 1
+        if self.frames_since_emit < self.emit_every_frames:
+            return None
+        self.frames_since_emit = 0
+        return self._decode_tail(self.emit_every_frames)
+
+    def _decode_tail(self, frames: int) -> tuple[np.ndarray, int]:
+        start = max(0, len(self.codes) - self.decode_window_frames)
+        codes = torch.stack(self.codes[start:], dim=0).to(self.model.talker.device)
+        if self.use_optimized_decode and hasattr(self.model.speech_tokenizer, "decode_streaming"):
+            wavs, sr = self.model.speech_tokenizer.decode_streaming(codes, use_optimized=True, pad_to_size=self.decode_window_frames)
+        else:
+            wavs, sr = self.model.speech_tokenizer.decode([{"audio_codes": codes}])
+        chunk = wavs[0].astype(np.float32)
+        chunk = chunk[-self.model.speech_tokenizer.get_decode_upsample_rate() * frames:]
+        if self.decoded_tail is not None:
+            overlap = min(self.overlap_samples, len(self.decoded_tail), len(chunk))
+            if overlap:
+                chunk = np.concatenate([_crossfade(self.decoded_tail[-overlap:], chunk[:overlap]), chunk[overlap:]])
+        self.decoded_tail = chunk.copy()
+        if len(chunk) > self.overlap_samples * 2:
+            chunk = chunk[:-self.overlap_samples]
+        return chunk, sr
+
+    def flush(self) -> Optional[tuple[np.ndarray, int]]:
+        if not self.codes or self.frames_since_emit == 0:
+            return None
+        frames = self.frames_since_emit
+        self.frames_since_emit = 0
+        return self._decode_tail(frames)
+
+
 def _top_k_top_p_filtering(logits: torch.Tensor, top_k: int = 0, top_p: float = 1.0) -> torch.Tensor:
     """Apply top-k and top-p (nucleus) filtering to logits."""
     if top_k > 0:
@@ -2084,6 +2290,14 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
     
     def get_supported_languages(self):
         return self.supported_languages
+
+    def create_text_token_stream(
+        self,
+        language: str,
+        speaker: str,
+        **kwargs,
+    ) -> Qwen3TTSTextTokenStream:
+        return Qwen3TTSTextTokenStream(self, language, speaker, **kwargs)
 
     def enable_streaming_optimizations(
         self,
